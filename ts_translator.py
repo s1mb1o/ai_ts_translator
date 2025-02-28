@@ -17,10 +17,34 @@ import json
 import subprocess
 import tempfile
 import traceback
+import pickle
 from colorama import init, Fore, Style
 
 # Initialize colorama for colored console output
 init()
+
+# Cache filename for storing OpenAI responses
+CACHE_FILENAME = "openai_cache.pkl"
+
+def load_cache(filename):
+    """Load the cache from a pickle file."""
+    if os.path.exists(filename):
+        try:
+            with open(filename, "rb") as f:
+                cache = pickle.load(f)
+                return cache
+        except Exception as e:
+            print(f"{Fore.RED}Error loading cache: {e}{Style.RESET_ALL}")
+            return {}
+    return {}
+
+def save_cache(cache, filename):
+    """Save the cache to a pickle file."""
+    try:
+        with open(filename, "wb") as f:
+            pickle.dump(cache, f)
+    except Exception as e:
+        print(f"{Fore.RED}Error saving cache: {e}{Style.RESET_ALL}")
 
 def write_ts_file(tree, ts_file):
     xml_str = ET.tostring(tree.getroot(), encoding='utf-8').decode('utf-8')
@@ -51,9 +75,10 @@ def get_target_language(root):
         sys.exit(1)
     return language
 
-def translate_with_openai(source_text, context_name, comment, extracomment, target_language, openai_url, openai_token, openai_model, additional_prompt, debug=False):
+def translate_with_openai(source_text, context_name, comment, extracomment, target_language,
+                          openai_url, openai_token, openai_model, additional_prompt, cache, debug=False):
     """
-    Translate text using OpenAI API.
+    Translate text using OpenAI API with caching.
     
     Args:
         source_text: The text to translate
@@ -65,6 +90,7 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
         openai_token: The OpenAI API token
         openai_model: The OpenAI model to use
         additional_prompt: Extra prompt content loaded from file
+        cache: Dictionary for caching responses
         debug: Whether to print debug information
         
     Returns:
@@ -95,7 +121,7 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
     target_language_name = language_map.get(target_language, target_language)
     
     # Prepare the prompt for OpenAI
-    system_prompt = f"""You are a professional translator to {target_language_name}."""
+    system_prompt = f"You are a professional translator to {target_language_name}."
     
     prompt = f"""
 Translate the provided source text from the source language to {target_language_name}.
@@ -117,6 +143,13 @@ Context: {context_name}
 Comment: {comment}
 Extracomment: {extracomment}
 """
+    # Create a cache key based on the inputs
+    key = (source_text, context_name, comment, extracomment, target_language, additional_prompt, openai_model, openai_url)
+    if key in cache:
+        if debug:
+            print(f"{Fore.CYAN}Cache hit for given input.{Style.RESET_ALL}")
+        return cache[key]
+    
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {openai_token}'
@@ -169,6 +202,9 @@ Extracomment: {extracomment}
                 if len(paragraphs) > 1:
                     explanation_line = paragraphs[1]
         
+        # Cache the result and save to file
+        cache[key] = (translation_line, explanation_line, confidence_line)
+        save_cache(cache, CACHE_FILENAME)
         return translation_line, explanation_line, confidence_line
         
     except requests.exceptions.RequestException as e:
@@ -221,7 +257,8 @@ def should_translate_element(translation_elem, translate_empty=False):
     # Translate if it's unfinished or (it's empty and translate_empty is True)
     return is_unfinished or (is_empty and translate_empty)
 
-def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_prompt, debug=False, translate_empty=False, skip_ui=False):
+def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_prompt,
+                    cache, debug=False, translate_empty=False, skip_ui=False):
     """Process the TS file and translate unfinished translations."""
     try:
         # Parse the TS file
@@ -326,12 +363,13 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                         else:
                             print(f"{Fore.GREEN}Current empty translation:{Style.RESET_ALL} {current_translation}")
                     
-                    # Translate using OpenAI
+                    # Translate using OpenAI with caching
                     if debug:
                         print(f"{Fore.CYAN}Translating...{Style.RESET_ALL}")
                     translated_text, explanation, confidence = translate_with_openai(
                         source_text, context_name, comment_text, extracomment_text,
-                        target_language, openai_url, openai_token, openai_model, additional_prompt, debug
+                        target_language, openai_url, openai_token, openai_model,
+                        additional_prompt, cache, debug
                     )
                     
                     # If source text is missing (i.e. only "..." or "…"), move the error message to explanation and set confidence to 0.
@@ -420,6 +458,9 @@ def main():
             print(f"{Fore.RED}Error: Additional prompt file '{args.additional_prompt_file}' not found.{Style.RESET_ALL}")
             sys.exit(1)
     
+    # Load the cache from file
+    cache = load_cache(CACHE_FILENAME)
+    
     # Check if the TS file exists
     if not os.path.isfile(args.ts_file):
         print(f"{Fore.RED}Error: TS file '{args.ts_file}' not found.{Style.RESET_ALL}")
@@ -437,9 +478,9 @@ def main():
     if args.skip_ui:
         print(f"{Fore.CYAN}Skipping translations from UI files{Style.RESET_ALL}")
     
-    # Process the TS file with the loaded additional prompt
+    # Process the TS file with the loaded additional prompt and cache
     process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model,
-                    additional_prompt, debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
+                    additional_prompt, cache, debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
 
 if __name__ == "__main__":
     main()
