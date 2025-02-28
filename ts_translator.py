@@ -40,6 +40,7 @@ def parse_arguments():
                         help='Also translate empty translation elements (without type="unfinished")')
     parser.add_argument('--skip-ui', action='store_true',
                         help='Skip translations located in UI files')
+    parser.add_argument('--additional-prompt-file', help='Path to file with additional prompt text', default=None)
     return parser.parse_args()
 
 def get_target_language(root):
@@ -50,7 +51,7 @@ def get_target_language(root):
         sys.exit(1)
     return language
 
-def translate_with_openai(source_text, context_name, comment, extracomment, target_language, openai_url, openai_token, openai_model, debug=False):
+def translate_with_openai(source_text, context_name, comment, extracomment, target_language, openai_url, openai_token, openai_model, additional_prompt, debug=False):
     """
     Translate text using OpenAI API.
     
@@ -63,6 +64,7 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
         openai_url: The OpenAI API URL
         openai_token: The OpenAI API token
         openai_model: The OpenAI model to use
+        additional_prompt: Extra prompt content loaded from file
         debug: Whether to print debug information
         
     Returns:
@@ -219,7 +221,7 @@ def should_translate_element(translation_elem, translate_empty=False):
     # Translate if it's unfinished or (it's empty and translate_empty is True)
     return is_unfinished or (is_empty and translate_empty)
 
-def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False, translate_empty=False, skip_ui=False):
+def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_prompt, debug=False, translate_empty=False, skip_ui=False):
     """Process the TS file and translate unfinished translations."""
     try:
         # Parse the TS file
@@ -329,7 +331,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
                         print(f"{Fore.CYAN}Translating...{Style.RESET_ALL}")
                     translated_text, explanation, confidence = translate_with_openai(
                         source_text, context_name, comment_text, extracomment_text,
-                        target_language, openai_url, openai_token, openai_model, debug
+                        target_language, openai_url, openai_token, openai_model, additional_prompt, debug
                     )
                     
                     # If source text is missing (i.e. only "..." or "…"), move the error message to explanation and set confidence to 0.
@@ -408,6 +410,16 @@ def main():
     """Main function."""
     args = parse_arguments()
     
+    # Load additional prompt from file if provided
+    additional_prompt = ""
+    if args.additional_prompt_file:
+        if os.path.isfile(args.additional_prompt_file):
+            with open(args.additional_prompt_file, 'r', encoding='utf-8') as f:
+                additional_prompt = f.read()
+        else:
+            print(f"{Fore.RED}Error: Additional prompt file '{args.additional_prompt_file}' not found.{Style.RESET_ALL}")
+            sys.exit(1)
+    
     # Check if the TS file exists
     if not os.path.isfile(args.ts_file):
         print(f"{Fore.RED}Error: TS file '{args.ts_file}' not found.{Style.RESET_ALL}")
@@ -425,9 +437,9 @@ def main():
     if args.skip_ui:
         print(f"{Fore.CYAN}Skipping translations from UI files{Style.RESET_ALL}")
     
-    # Process the TS file
+    # Process the TS file with the loaded additional prompt
     process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model,
-                    debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
+                    additional_prompt, debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
 
 if __name__ == "__main__":
     main()
