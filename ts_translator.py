@@ -38,6 +38,8 @@ def parse_arguments():
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--translate-empty', action='store_true', 
                         help='Also translate empty translation elements (without type="unfinished")')
+    parser.add_argument('--skip-ui', action='store_true',
+                        help='Skip translations located in UI files')
     return parser.parse_args()
 
 def get_target_language(root):
@@ -72,7 +74,6 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
             openai_url = openai_url + 'chat/completions'
         else:
             openai_url = openai_url + '/chat/completions'
-
         if debug:
             print(f"{Fore.CYAN}Updated OpenAI URL to: {openai_url}{Style.RESET_ALL}")
     
@@ -92,14 +93,11 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
     target_language_name = language_map.get(target_language, target_language)
     
     # Prepare the prompt for OpenAI
+    system_prompt = f"""You are a professional translator to {target_language_name}."""
+    
     prompt = f"""
-Translate the following text from the source language to {target_language_name}.
+Translate the provided source text from the source language to {target_language_name}.
 Consider the context, comment, and extracomment provided.
-
-Source text: {source_text}
-Context: {context_name}
-Comment: {comment}
-Extracomment: {extracomment}
 
 Please provide:
 1. The translation in {target_language_name}
@@ -110,6 +108,12 @@ Format your response as:
 TRANSLATION: [your translation]
 EXPLANATION: [your explanation]
 CONFIDENCE: [your confidence percentage]
+
+Input is following:
+Source text: {source_text}
+Context: {context_name}
+Comment: {comment}
+Extracomment: {extracomment}
 """
     headers = {
         'Content-Type': 'application/json',
@@ -119,7 +123,7 @@ CONFIDENCE: [your confidence percentage]
     data = {
         'model': openai_model,
         'messages': [
-            {'role': 'system', 'content': f'You are a professional translator to {target_language_name}.'},
+            {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': prompt}
         ],
         'temperature': 0.3
@@ -215,7 +219,7 @@ def should_translate_element(translation_elem, translate_empty=False):
     # Translate if it's unfinished or (it's empty and translate_empty is True)
     return is_unfinished or (is_empty and translate_empty)
 
-def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False, translate_empty=False):
+def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False, translate_empty=False, skip_ui=False):
     """Process the TS file and translate unfinished translations."""
     try:
         # Parse the TS file
@@ -251,6 +255,16 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
             
             # Iterate through all messages in the context
             for message in context.findall('message'):
+                # If --skip-ui is enabled, skip messages with location filenames ending with ".ui"
+                if skip_ui:
+                    location_elems = message.findall('location')
+                    if any(loc.attrib.get('filename', '').lower().endswith('.ui') for loc in location_elems):
+                        if debug:
+                            for loc in location_elems:
+                                if loc.attrib.get('filename', '').lower().endswith('.ui'):
+                                    print(f"{Fore.CYAN}Skipping UI file translation for message in context '{context_name}' at location {loc.attrib.get('filename','')}:{loc.attrib.get('line','')}{Style.RESET_ALL}")
+                        continue
+
                 translation_elem = message.find('translation')
                 
                 # Check if translation element exists
@@ -294,7 +308,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
                         line_no = loc.attrib.get('line', '')
                         if filename:
                             print(f"{Fore.BLUE}Location:{Style.RESET_ALL} {filename}:{line_no}")
-
+                    
                     print(f"{Fore.GREEN}Context:{Style.RESET_ALL} {context_name}")
                     print(f"{Fore.GREEN}Source:{Style.RESET_ALL} {source_text}")
                     if comment_text:
@@ -313,7 +327,6 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
                     # Translate using OpenAI
                     if debug:
                         print(f"{Fore.CYAN}Translating...{Style.RESET_ALL}")
-
                     translated_text, explanation, confidence = translate_with_openai(
                         source_text, context_name, comment_text, extracomment_text,
                         target_language, openai_url, openai_token, openai_model, debug
@@ -331,8 +344,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
                         print(f"{Fore.GREEN}Confidence:{Style.RESET_ALL} {confidence}")
                     if translated_text:
                         print(f"{Fore.GREEN}Translated text:{Style.RESET_ALL} {translated_text}")
-
-
+                    
                     # Ask for user confirmation
                     while True:
                         if not translated_text and explanation.startswith("I'm sorry, but it seems"):
@@ -340,7 +352,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, debug=False
                             valid_choices = {'no', 'n', 'edit', 'e', 'quit', 'q'}
                         else:
                             prompt_str = f"{Fore.YELLOW}Accept this translation? (yes/no/edit/quit): {Style.RESET_ALL}"
-                            valid_choices = {'yes', 'y', 'no', 'n', 'edit', 'quit', 'q'}
+                            valid_choices = {'yes', 'y', 'no', 'n', 'edit', 'e', 'quit', 'q'}
                         
                         choice = input(prompt_str).lower()
                         
@@ -410,8 +422,12 @@ def main():
     else:
         print(f"{Fore.CYAN}Will translate only unfinished translations (use --translate-empty to include empty translations){Style.RESET_ALL}")
     
+    if args.skip_ui:
+        print(f"{Fore.CYAN}Skipping translations from UI files{Style.RESET_ALL}")
+    
     # Process the TS file
-    process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model, args.debug, args.translate_empty)
+    process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model,
+                    debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
 
 if __name__ == "__main__":
     main()
