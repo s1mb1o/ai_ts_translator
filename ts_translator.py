@@ -6,6 +6,10 @@ Qt TS File Translator
 
 This script processes Qt TS files, finds unfinished translations, and uses OpenAI
 to help translate them. The user can confirm, skip, edit, or quit for each translation.
+With the --cache-only option the script runs without prompting the user or modifying the TS file,
+and only fills the OpenAI response cache.
+Additionally, you can specify context name prefixes (using --skip-context-prefixes)
+to skip translation for certain contexts.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import subprocess
 import tempfile
 import traceback
 import pickle
+import re
 from colorama import init, Fore, Style
 
 # Initialize colorama for colored console output
@@ -65,6 +70,10 @@ def parse_arguments():
     parser.add_argument('--skip-ui', action='store_true',
                         help='Skip translations located in UI files')
     parser.add_argument('--additional-prompt-file', help='Path to file with additional prompt text', default=None)
+    parser.add_argument('--cache-only', action='store_true',
+                        help='Run without asking user or modifying TS file; only fill the OpenAI response cache')
+    parser.add_argument('--skip-context-prefixes', default="",
+                        help='Comma-separated list of context name prefixes to skip and not translate')
     return parser.parse_args()
 
 def get_target_language(root):
@@ -127,12 +136,18 @@ def translate_with_openai(source_text, context_name, comment, extracomment, targ
 Translate the provided source text from the source language to {target_language_name}.
 Consider the context, comment, and extracomment provided.
 
+{additional_prompt}
+
 Please provide:
 1. The translation in {target_language_name}
 2. A brief explanation of your translation choices
-3. A confidence score (from 0 to 100%) indicating your confidence in the translation
+3. A confidence score (from 0 to 100) indicating your confidence in the translation
 
-Format your response as:
+If the source text is a multiline passage, please preserve its original line breaks and translate each line accordingly.
+If the source text appears to already be in {target_language_name}, return source text as is, indicate 0 confidence and an explanation that the text is already in the target language.
+If the source text contains placeholders such as %1, %2, %3, etc., ensure these placeholders are preserved in the translated text in the correct position so that the meaning remains consistent.
+
+Format your response exactly as:
 TRANSLATION: [your translation]
 EXPLANATION: [your explanation]
 CONFIDENCE: [your confidence percentage]
@@ -183,29 +198,23 @@ Extracomment: {extracomment}
         result = response.json()
         content = result['choices'][0]['message']['content']
         
-        translation_line = None
-        explanation_line = None
-        confidence_line = None
-        
-        for line in content.split('\n'):
-            if line.startswith('TRANSLATION:'):
-                translation_line = line.replace('TRANSLATION:', '').strip()
-            elif line.startswith('EXPLANATION:'):
-                explanation_line = line.replace('EXPLANATION:', '').strip()
-            elif line.startswith('CONFIDENCE:'):
-                confidence_line = line.replace('CONFIDENCE:', '').strip()
-        
-        if not translation_line:
+        # Use regular expressions to capture potentially multiline output.
+        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE:\s*(.*)", content, re.DOTALL)
+        if match:
+            translation_text = match.group(1).strip()
+            explanation_text = match.group(2).strip()
+            confidence_text = match.group(3).strip()
+        else:
+            # Fallback if expected markers are not found:
             paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
-            if paragraphs:
-                translation_line = paragraphs[0]
-                if len(paragraphs) > 1:
-                    explanation_line = paragraphs[1]
+            translation_text = paragraphs[0] if paragraphs else ""
+            explanation_text = paragraphs[1] if len(paragraphs) > 1 else ""
+            confidence_text = paragraphs[2] if len(paragraphs) > 2 else ""
         
         # Cache the result and save to file
-        cache[key] = (translation_line, explanation_line, confidence_line)
+        cache[key] = (translation_text, explanation_text, confidence_text)
         save_cache(cache, CACHE_FILENAME)
-        return translation_line, explanation_line, confidence_line
+        return translation_text, explanation_text, confidence_text
         
     except requests.exceptions.RequestException as e:
         print(f"{Fore.RED}Error calling OpenAI API: {str(e)}{Style.RESET_ALL}")
@@ -258,7 +267,7 @@ def should_translate_element(translation_elem, translate_empty=False):
     return is_unfinished or (is_empty and translate_empty)
 
 def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_prompt,
-                    cache, debug=False, translate_empty=False, skip_ui=False):
+                    cache, debug=False, translate_empty=False, skip_ui=False, cache_only=False, skip_context_prefixes=None):
     """Process the TS file and translate unfinished translations."""
     try:
         # Parse the TS file
@@ -275,6 +284,12 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
         processed_count = 0
         
         # Iterate through all contexts
+        # Process comma-separated context prefixes into a list
+        if skip_context_prefixes:
+            prefixes = [p.strip() for p in skip_context_prefixes.split(',') if p.strip()]
+        else:
+            prefixes = []
+        
         for context in root.findall('.//context'):
             # Get context name with error handling
             context_name_elem = context.find('name')
@@ -288,7 +303,11 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                 if debug:
                     print(f"{Fore.RED}Debug - Warning: Found context with empty name, using empty string.{Style.RESET_ALL}")
                 context_name = ""
-            
+            elif any(context_name.startswith(prefix) for prefix in prefixes):
+                if debug:
+                    print(f"{Fore.CYAN}Skipping context '{context_name}' due to skip-context-prefixes setting.{Style.RESET_ALL}")
+                continue
+
             if debug:
                 print(f"{Fore.CYAN}Debug - Processing context: {context_name}{Style.RESET_ALL}")
             
@@ -386,50 +405,60 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                         print(f"{Fore.GREEN}Translated text:{Style.RESET_ALL} {translated_text}")
                     
                     # Ask for user confirmation
-                    while True:
-                        if not translated_text and explanation.startswith("I'm sorry, but it seems"):
-                            prompt_str = f"{Fore.YELLOW}Accept this translation? (no/edit/quit): {Style.RESET_ALL}"
-                            valid_choices = {'no', 'n', 'edit', 'e', 'quit', 'q'}
+                    if not cache_only:
+                        # Ask for user confirmation if not in cache-only mode
+                        if confidence and float(confidence.strip()) < 10:
+                            print(f"{Fore.CYAN}Confidence is 0%, automatically skipping this translation.{Style.RESET_ALL}")
                         else:
-                            prompt_str = f"{Fore.YELLOW}Accept this translation? (yes/no/edit/quit): {Style.RESET_ALL}"
-                            valid_choices = {'yes', 'y', 'no', 'n', 'edit', 'e', 'quit', 'q'}
-                        
-                        choice = input(prompt_str).lower()
-                        
-                        if choice not in valid_choices:
-                            print(f"{Fore.RED}Invalid choice. Please enter one of {', '.join(valid_choices)}.{Style.RESET_ALL}")
-                            continue
-                        
-                        if choice in ('yes', 'y'):
-                            translation_elem.text = translated_text
-                            if 'type' in translation_elem.attrib:
-                                translation_elem.attrib.pop('type', None)
-                            processed_count += 1
-                            break
-                        elif choice in ('no', 'n'):
-                            print(f"{Fore.CYAN}Skipping this translation.{Style.RESET_ALL}")
-                            break
-                        elif choice in ('edit', 'e'):
-                            edited_translation = edit_translation(translated_text)
-                            print(f"{Fore.GREEN}Edited translation:{Style.RESET_ALL} {edited_translation}")
-                            
-                            confirm_edit = input(f"{Fore.YELLOW}Use this edited translation? (yes/no): {Style.RESET_ALL}").lower()
-                            if confirm_edit in ('yes', 'y'):
-                                translation_elem.text = edited_translation
-                                if 'type' in translation_elem.attrib:
-                                    translation_elem.attrib.pop('type', None)
-                                processed_count += 1
-                                break
-                        elif choice in ('quit', 'q'):
-                            print(f"{Fore.CYAN}Quitting...{Style.RESET_ALL}")
-                            write_ts_file(tree, ts_file)
-                            print(f"{Fore.GREEN}Saved {processed_count} translations out of {unfinished_count + empty_count} total translations.{Style.RESET_ALL}")
-                            return
-        # Save the changes
-        write_ts_file(tree, ts_file)
-        print(f"\n{Fore.GREEN}Completed! Processed {processed_count} out of {unfinished_count + empty_count} total translations.{Style.RESET_ALL}")
-        if translate_empty:
-            print(f"{Fore.GREEN}Details: {unfinished_count} unfinished translations, {empty_count} empty translations.{Style.RESET_ALL}")
+                            while True:
+                                if not translated_text and explanation.startswith("I'm sorry, but it seems"):
+                                    prompt_str = f"{Fore.YELLOW}Accept this translation? (no/edit/quit): {Style.RESET_ALL}"
+                                    valid_choices = {'no', 'n', 'edit', 'e', 'quit', 'q'}
+                                else:
+                                    prompt_str = f"{Fore.YELLOW}Accept this translation? (yes/no/edit/quit): {Style.RESET_ALL}"
+                                    valid_choices = {'yes', 'y', 'no', 'n', 'edit', 'e', 'quit', 'q'}
+                                
+                                choice = input(prompt_str).lower()
+                                
+                                if choice not in valid_choices:
+                                    print(f"{Fore.RED}Invalid choice. Please enter one of {', '.join(valid_choices)}.{Style.RESET_ALL}")
+                                    continue
+                                
+                                if choice in ('yes', 'y'):
+                                    translation_elem.text = translated_text
+                                    if 'type' in translation_elem.attrib:
+                                        translation_elem.attrib.pop('type', None)
+                                    processed_count += 1
+                                    break
+                                elif choice in ('no', 'n'):
+                                    print(f"{Fore.CYAN}Skipping this translation.{Style.RESET_ALL}")
+                                    break
+                                elif choice in ('edit', 'e'):
+                                    edited_translation = edit_translation(translated_text)
+                                    print(f"{Fore.GREEN}Edited translation:{Style.RESET_ALL} {edited_translation}")
+                                    
+                                    confirm_edit = input(f"{Fore.YELLOW}Use this edited translation? (yes/no): {Style.RESET_ALL}").lower()
+                                    if confirm_edit in ('yes', 'y'):
+                                        translation_elem.text = edited_translation
+                                        if 'type' in translation_elem.attrib:
+                                            translation_elem.attrib.pop('type', None)
+                                        processed_count += 1
+                                        break
+                                elif choice in ('quit', 'q'):
+                                    print(f"{Fore.CYAN}Quitting...{Style.RESET_ALL}")
+                                    write_ts_file(tree, ts_file)
+                                    print(f"{Fore.GREEN}Saved {processed_count} translations out of {unfinished_count + empty_count} total translations.{Style.RESET_ALL}")
+                                    return
+                    else:
+                        processed_count += 1
+        
+        if not cache_only:
+            write_ts_file(tree, ts_file)
+            print(f"\n{Fore.GREEN}Completed! Processed {processed_count} out of {unfinished_count + empty_count} total translations.{Style.RESET_ALL}")
+            if translate_empty:
+                print(f"{Fore.GREEN}Details: {unfinished_count} unfinished translations, {empty_count} empty translations.{Style.RESET_ALL}")
+        else:
+            print(f"\n{Fore.GREEN}Cache-only mode complete. Processed {processed_count} translations without modifying the TS file.{Style.RESET_ALL}")
         
     except ET.ParseError as e:
         print(f"{Fore.RED}Error parsing TS file: {str(e)}{Style.RESET_ALL}")
@@ -478,9 +507,16 @@ def main():
     if args.skip_ui:
         print(f"{Fore.CYAN}Skipping translations from UI files{Style.RESET_ALL}")
     
+    if args.cache_only:
+        print(f"{Fore.CYAN}Running in cache-only mode: TS file will not be modified and no user input will be requested.{Style.RESET_ALL}")
+    
     # Process the TS file with the loaded additional prompt and cache
+    if args.skip_context_prefixes:
+        print(f"{Fore.CYAN}Skipping contexts with prefixes: {args.skip_context_prefixes}{Style.RESET_ALL}")
+    
     process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model,
-                    additional_prompt, cache, debug=args.debug, translate_empty=args.translate_empty, skip_ui=args.skip_ui)
+                    additional_prompt, cache, debug=args.debug, translate_empty=args.translate_empty,
+                    skip_ui=args.skip_ui, cache_only=args.cache_only, skip_context_prefixes=args.skip_context_prefixes)
 
 if __name__ == "__main__":
     main()
