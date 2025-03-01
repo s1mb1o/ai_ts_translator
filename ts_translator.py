@@ -395,6 +395,24 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                     for loc in location_elems:
                         filename = loc.attrib.get('filename', '')
                         line_no = loc.attrib.get('line', '')
+                        # Transform location path relatively to ts file directory
+                        if filename:
+                            # Get the directory of the TS file
+                            ts_file_dir = os.path.dirname(os.path.abspath(ts_file))
+                            
+                            # Try to make the path absolute relative to the TS file directory
+                            try:
+                                # If the filename is not already absolute
+                                if not os.path.isabs(filename):
+                                    # Make it absolute by joining with the TS file directory
+                                    abs_path = os.path.normpath(os.path.join(ts_file_dir, filename))
+                                    if debug:
+                                        print(f"{Fore.CYAN}Transformed relative path '{filename}' to absolute path '{abs_path}'{Style.RESET_ALL}")
+                                    filename = abs_path
+                            except Exception as e:
+                                if debug:
+                                    print(f"{Fore.RED}Error transforming path: {e}{Style.RESET_ALL}")
+                        
                         if filename:
                             print(f"{Fore.BLUE}Location:{Style.RESET_ALL} {filename}:{line_no}")
                     
