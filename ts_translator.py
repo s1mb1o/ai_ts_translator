@@ -199,7 +199,7 @@ Extracomment: {extracomment}
         content = result['choices'][0]['message']['content']
         
         # Use regular expressions to capture potentially multiline output.
-        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE:\s*(.*)", content, re.DOTALL)
+        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE:\s*(.*?)\s*", content, re.DOTALL)
         if match:
             translation_text = match.group(1).strip()
             explanation_text = match.group(2).strip()
@@ -395,7 +395,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                     if source_text.strip() in ["...", "…"]:
                         explanation = translated_text
                         translated_text = ""
-                        confidence = "0%"
+                        confidence = "0"
                     
                     if explanation:
                         print(f"{Fore.GREEN}Explanation:{Style.RESET_ALL} {explanation}")
@@ -407,7 +407,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                     # Ask for user confirmation
                     if not cache_only:
                         # Ask for user confirmation if not in cache-only mode
-                        if confidence and float(confidence.strip()) < 10:
+                        if confidence and float(confidence.strip().rstrip('%').strip()) < 10:
                             print(f"{Fore.CYAN}Confidence is 0%, automatically skipping this translation.{Style.RESET_ALL}")
                         else:
                             while True:
