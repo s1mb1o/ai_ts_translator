@@ -74,6 +74,8 @@ def parse_arguments():
                         help='Run without asking user or modifying TS file; only fill the OpenAI response cache')
     parser.add_argument('--skip-context-prefixes', default="",
                         help='Comma-separated list of context name prefixes to skip and not translate')
+    parser.add_argument('--translate-non-english-source', action='store_true',
+                        help='Detect and translate non-English source text to English (without modifying the TS file)')
     return parser.parse_args()
 
 def get_target_language(root):
@@ -150,7 +152,8 @@ If the source text contains placeholders such as %1, %2, %3, etc., ensure these 
 Format your response exactly as:
 TRANSLATION: [your translation]
 EXPLANATION: [your explanation]
-CONFIDENCE: [your confidence percentage]
+CONFIDENCE_PERCENTAGE: [your confidence percentage without % sign]
+END_RESPONSE
 
 Input is following:
 Source text: {source_text}
@@ -199,7 +202,7 @@ Extracomment: {extracomment}
         content = result['choices'][0]['message']['content']
         
         # Use regular expressions to capture potentially multiline output.
-        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE:\s*(.*?)\s*", content, re.DOTALL)
+        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE_PERCENTAGE:\s*(.*?)\s*END_RESPONSE", content, re.DOTALL)
         if match:
             translation_text = match.group(1).strip()
             explanation_text = match.group(2).strip()
@@ -246,6 +249,144 @@ def edit_translation(translation):
         os.unlink(temp_filename)
         return translation
 
+def translate_source_to_english(source_text, context_name, comment, extracomment,
+                               openai_url, openai_token, openai_model, additional_prompt, cache, debug=False):
+    """
+    Translate non-English source text to English using OpenAI API with caching.
+    
+    Args:
+        source_text: The source text to translate to English
+        context_name: The context name from the TS file
+        comment: The comment from the TS file
+        extracomment: The extracomment from the TS file
+        openai_url: The OpenAI API URL
+        openai_token: The OpenAI API token
+        openai_model: The OpenAI model to use
+        additional_prompt: Extra prompt content loaded from file
+        cache: Dictionary for caching responses
+        debug: Whether to print debug information
+        
+    Returns:
+        tuple: (translated_text, explanation, confidence)
+    """
+    # Ensure the OpenAI URL ends with /chat/completions
+    if not openai_url.endswith('/chat/completions'):
+        if openai_url.endswith('/'):
+            openai_url = openai_url + 'chat/completions'
+        else:
+            openai_url = openai_url + '/chat/completions'
+        if debug:
+            print(f"{Fore.CYAN}Updated OpenAI URL to: {openai_url}{Style.RESET_ALL}")
+    
+    # Create a special cache key for source-to-English translations
+    key = ("source_to_english", source_text, context_name, comment, extracomment, additional_prompt, openai_model, openai_url)
+    if key in cache:
+        if debug:
+            print(f"{Fore.CYAN}Cache hit for source-to-English translation.{Style.RESET_ALL}")
+        return cache[key]
+    
+    # Prepare the prompt for OpenAI
+    system_prompt = "You are a professional translator to English."
+    
+    prompt = f"""
+Translate the provided source text to English.
+Consider the context, comment, and extracomment provided.
+
+{additional_prompt}
+
+Please provide:
+1. The translation in English
+2. A brief explanation of your translation choices
+3. A confidence score (from 0 to 100) indicating your confidence in the translation
+
+If the source text is a multiline passage, please preserve its original line breaks and translate each line accordingly.
+If the source text appears to already be in English, return source text as is, indicate 0 confidence and an explanation that the text is already in English.
+If the source text contains placeholders such as %1, %2, %3, etc., ensure these placeholders are preserved in the translated text in the correct position so that the meaning remains consistent.
+
+Format your response exactly as:
+TRANSLATION: [your translation]
+EXPLANATION: [your explanation]
+CONFIDENCE_PERCENTAGE: [your confidence percentage without % sign]
+END_RESPONSE
+
+Input is following:
+Source text: {source_text}
+Context: {context_name}
+Comment: {comment}
+Extracomment: {extracomment}
+"""
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {openai_token}'
+    }
+    
+    data = {
+        'model': openai_model,
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': prompt}
+        ],
+        'temperature': 0.3
+    }
+    
+    try:
+        if debug:
+            print(f"{Fore.CYAN}Debug - OpenAI URL: {openai_url}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Debug - OpenAI Model: {openai_model}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Debug - Headers: {headers}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Debug - Data: {json.dumps(data, indent=2)}{Style.RESET_ALL}")
+        
+        response = requests.post(openai_url, headers=headers, data=json.dumps(data))
+        
+        if debug:
+            print(f"{Fore.CYAN}Debug - Response Status Code: {response.status_code}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Debug - Response Headers: {response.headers}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Debug - Response Content: {response.text}{Style.RESET_ALL}")
+        
+        response.raise_for_status()
+        
+        result = response.json()
+        content = result['choices'][0]['message']['content']
+        
+        # Use regular expressions to capture potentially multiline output.
+        match = re.search(r"TRANSLATION:\s*(.*?)\s*EXPLANATION:\s*(.*?)\s*CONFIDENCE_PERCENTAGE:\s*(.*?)\s*END_RESPONSE", content, re.DOTALL)
+        if match:
+            if debug:
+                print(f"{Fore.CYAN}Debug - Match: {match.group(1).strip()} {match.group(2).strip()} {match.group(3).strip()}{Style.RESET_ALL}")
+            
+            translation_text = match.group(1).strip()
+            explanation_text = match.group(2).strip()
+            confidence_text = match.group(3).strip()
+        else:
+            # Fallback if expected markers are not found:
+            if debug:
+                print(f"{Fore.CYAN}Debug - No match found{Style.RESET_ALL}")
+
+            paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+            translation_text = paragraphs[0] if paragraphs else ""
+            explanation_text = paragraphs[1] if len(paragraphs) > 1 else ""
+            confidence_text = paragraphs[2] if len(paragraphs) > 2 else ""
+        
+        print(f"{Fore.CYAN}Debug - Translation text: {translation_text}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Debug - Explanation text: {explanation_text}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Debug - Confidence text: {confidence_text}{Style.RESET_ALL}")
+
+        # Cache the result and save to file
+        cache[key] = (translation_text, explanation_text, confidence_text)
+        save_cache(cache, CACHE_FILENAME)
+        return translation_text, explanation_text, confidence_text
+        
+    except requests.exceptions.RequestException as e:
+        print(f"{Fore.RED}Error calling OpenAI API: {str(e)}{Style.RESET_ALL}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"{Fore.RED}Response status code: {e.response.status_code}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Response content: {e.response.text}{Style.RESET_ALL}")
+        return None, None, None
+    except Exception as e:
+        print(f"{Fore.RED}Unexpected error: {str(e)}{Style.RESET_ALL}")
+        return None, None, None
+
 def should_translate_element(translation_elem, translate_empty=False):
     """
     Determine if a translation element should be translated.
@@ -267,7 +408,8 @@ def should_translate_element(translation_elem, translate_empty=False):
     return is_unfinished or (is_empty and translate_empty)
 
 def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_prompt,
-                    cache, debug=False, translate_empty=False, skip_ui=False, cache_only=False, skip_context_prefixes=None):
+                    cache, debug=False, translate_empty=False, skip_ui=False, cache_only=False, skip_context_prefixes=None,
+                    translate_non_english_source=False):
     """Process the TS file and translate unfinished translations."""
     try:
         # Parse the TS file
@@ -282,6 +424,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
         unfinished_count = 0
         empty_count = 0
         processed_count = 0
+        non_english_source_count = 0
         
         # Iterate through all contexts
         # Process comma-separated context prefixes into a list
@@ -369,6 +512,26 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                     
                     print(f"{Fore.GREEN}Context:{Style.RESET_ALL} {context_name}")
                     print(f"{Fore.GREEN}Source:{Style.RESET_ALL} {source_text}")
+                    
+                    # If translate_non_english_source is enabled, check if source text needs translation to English
+                    if translate_non_english_source and source_text.strip():
+                        # Translate source text to English
+                        english_source, explanation, confidence = translate_source_to_english(
+                            source_text, context_name, comment_text, extracomment_text,
+                            openai_url, openai_token, openai_model, additional_prompt, cache, debug
+                        )
+                        print(f"{Fore.GREEN}Confidence:{Style.RESET_ALL} {confidence}")
+
+                        # Check if the source was actually non-English (confidence > 50%)
+                        if confidence and float(confidence.strip().rstrip('%').strip()) > 50:
+                            non_english_source_count += 1
+                            print(f"{Fore.MAGENTA}Non-English source detected!{Style.RESET_ALL}")
+                            print(f"{Fore.MAGENTA}English translation:{Style.RESET_ALL} {english_source}")
+                            if explanation:
+                                print(f"{Fore.MAGENTA}Explanation:{Style.RESET_ALL} {explanation}")
+                            if confidence:
+                                print(f"{Fore.MAGENTA}Confidence:{Style.RESET_ALL} {confidence}")
+                    
                     if comment_text:
                         print(f"{Fore.GREEN}Comment:{Style.RESET_ALL} {comment_text}")
                     if extracomment_text:
@@ -385,6 +548,7 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
                     # Translate using OpenAI with caching
                     if debug:
                         print(f"{Fore.CYAN}Translating...{Style.RESET_ALL}")
+                    
                     translated_text, explanation, confidence = translate_with_openai(
                         source_text, context_name, comment_text, extracomment_text,
                         target_language, openai_url, openai_token, openai_model,
@@ -457,8 +621,12 @@ def process_ts_file(ts_file, openai_url, openai_token, openai_model, additional_
             print(f"\n{Fore.GREEN}Completed! Processed {processed_count} out of {unfinished_count + empty_count} total translations.{Style.RESET_ALL}")
             if translate_empty:
                 print(f"{Fore.GREEN}Details: {unfinished_count} unfinished translations, {empty_count} empty translations.{Style.RESET_ALL}")
+            if translate_non_english_source:
+                print(f"{Fore.GREEN}Found {non_english_source_count} non-English source texts that were translated to English.{Style.RESET_ALL}")
         else:
             print(f"\n{Fore.GREEN}Cache-only mode complete. Processed {processed_count} translations without modifying the TS file.{Style.RESET_ALL}")
+            if translate_non_english_source:
+                print(f"{Fore.GREEN}Found {non_english_source_count} non-English source texts that were translated to English.{Style.RESET_ALL}")
         
     except ET.ParseError as e:
         print(f"{Fore.RED}Error parsing TS file: {str(e)}{Style.RESET_ALL}")
@@ -510,13 +678,17 @@ def main():
     if args.cache_only:
         print(f"{Fore.CYAN}Running in cache-only mode: TS file will not be modified and no user input will be requested.{Style.RESET_ALL}")
     
+    if args.translate_non_english_source:
+        print(f"{Fore.CYAN}Will detect and translate non-English source text to English (without modifying the TS file){Style.RESET_ALL}")
+    
     # Process the TS file with the loaded additional prompt and cache
     if args.skip_context_prefixes:
         print(f"{Fore.CYAN}Skipping contexts with prefixes: {args.skip_context_prefixes}{Style.RESET_ALL}")
     
     process_ts_file(args.ts_file, args.openai_url, args.openai_token, args.openai_model,
                     additional_prompt, cache, debug=args.debug, translate_empty=args.translate_empty,
-                    skip_ui=args.skip_ui, cache_only=args.cache_only, skip_context_prefixes=args.skip_context_prefixes)
+                    skip_ui=args.skip_ui, cache_only=args.cache_only, skip_context_prefixes=args.skip_context_prefixes,
+                    translate_non_english_source=args.translate_non_english_source)
 
 if __name__ == "__main__":
     main()
